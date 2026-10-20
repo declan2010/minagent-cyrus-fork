@@ -39,3 +39,13 @@ test("permission settings reject booleans, uppercase names and unsupported modes
 		for (const value of ["on", "true", "AUTO", "invalid"]) await assert.rejects(load({ [name]: value }), new RegExp(name));
 	}
 });
+
+test("OPENAI_TIMEOUT_MS defaults to 0, accepts integers and rejects invalid values", async (t) => {
+	const load = await configuration(t);
+	assert.equal((await load()).timeoutMs, 0);
+	assert.equal((await load({ OPENAI_TIMEOUT_MS: "3600000" })).timeoutMs, 3600000);
+	assert.equal((await load({ OPENAI_TIMEOUT_MS: "" })).timeoutMs, 0);
+	for (const value of ["-1", "1.5", "abc", "true", "9007199254740993"]) {
+		await assert.rejects(load({ OPENAI_TIMEOUT_MS: value }), /OPENAI_TIMEOUT_MS/);
+	}
+});

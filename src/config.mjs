@@ -34,6 +34,14 @@ function parsePositiveInteger(value, name, fallback) {
 	return parsed;
 }
 
+function parseNonNegativeInteger(value, name, fallback) {
+	if (value === undefined || value.trim() === "") return fallback;
+	if (!/^\d+$/.test(value.trim())) throw new Error(`${name} must be a non-negative integer (0 disables timeouts).`);
+	const parsed = Number(value.trim());
+	if (!Number.isSafeInteger(parsed) || parsed < 0) throw new Error(`${name} must be a non-negative integer (0 disables timeouts).`);
+	return parsed;
+}
+
 function parsePermissionMode(value, name, fallback) {
 	const normalized = (value || fallback).trim();
 	if (!["auto", "ask", "off"].includes(normalized)) throw new Error(`${name} must be lowercase: auto, ask, or off.`);
@@ -82,6 +90,7 @@ export async function loadConfiguration({ appDirectory, cwd = process.cwd(), env
 	const model = env.OPENAI_MODEL?.trim();
 	if (!model) throw new Error("Set OPENAI_MODEL to the model identifier available on your endpoint.");
 	const contextWindow = parsePositiveInteger(env.OPENAI_CONTEXT_WINDOW, "OPENAI_CONTEXT_WINDOW", 262144);
+	const timeoutMs = parseNonNegativeInteger(env.OPENAI_TIMEOUT_MS, "OPENAI_TIMEOUT_MS", 0);
 	const inputModalities = parseInputModalities(env.OPENAI_INPUT);
 	const terminalMode = parsePermissionMode(env.TERMINAL_MODE, "TERMINAL_MODE", "ask");
 	return {
@@ -92,6 +101,7 @@ export async function loadConfiguration({ appDirectory, cwd = process.cwd(), env
 		apiKey: env.OPENAI_API_KEY?.trim(),
 		model,
 		contextWindow,
+		timeoutMs,
 		inputModalities,
 		terminalMode,
 		terminalCommandShell: process.platform === "win32" ? (env.ComSpec?.trim() || "cmd.exe") : "/bin/sh",

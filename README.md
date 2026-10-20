@@ -200,7 +200,7 @@ MinAgent discovers server tools at startup and exposes up to 32 tools to the mod
 - `src/markdown-terminal.mjs` and `src/terminal-text.mjs`: streaming Markdown and terminal text layout.
 - `src/terminal-command.mjs` and `src/processes.mjs`: terminal execution and process cleanup.
 - `src/tool-permissions.mjs`: shared Auto/Ask/Off permissions for terminal commands, skills, and MCP.
-- `src/openai.mjs`: OpenAI-compatible SSE client, one-hour timeout, tool-call reassembly, and reasoning deltas.
+- `src/openai.mjs`: OpenAI-compatible SSE client, `OPENAI_TIMEOUT_MS` timeout (0 disables it), tool-call reassembly, and reasoning deltas.
 - `src/config.mjs`: `.env` loading and configuration validation.
 - `src/workspace.mjs`: workspace boundaries and file operations.
 - `src/workspace-policy.mjs`: shared generated-directory exclusions for file autocomplete, searches, and `/init`.

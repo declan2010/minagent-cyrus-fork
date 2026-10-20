@@ -13,6 +13,7 @@ import { approvalPreview, redactLikelySecrets } from "./secrets.mjs";
 import { createOpenAiClient } from "./openai.mjs";
 import { buildAutocompleteState, formatAutocompletePanel, handleAutocompleteKeypress, handleControlJInput, handlePastedInput, handleVerticalInput, handleModelSelectorKeypress, handleModeKeypress } from "./editor.mjs";
 import { modelSettings } from "./models.mjs";
+import { ollamaBasesForEndpoint, persistModelDefault } from "./model-switch.mjs";
 import { toolsForMode, executeModeTool, assertModeCommand, createAgentModeState, modeInputPrompt } from "./agent-mode.mjs";
 import { slashCommands } from "./commands.mjs";
 import { workspaceTools } from "./tool-definitions.mjs";
@@ -40,6 +41,7 @@ let endpoint;
 let apiKey;
 let model;
 let contextWindow;
+let timeoutMs;
 let evidenceLedger;
 let inputModalities;
 let compactionReserveTokens;
@@ -172,6 +174,7 @@ async function initializeConfiguration() {
 		apiKey,
 		model,
 		contextWindow,
+		timeoutMs,
 		inputModalities,
 		terminalMode,
 		terminalCommandShell,
@@ -189,7 +192,7 @@ async function initializeConfiguration() {
 	workspaceAccess = createWorkspaceAccess(rootDirectory, workspaceName);
 	evidenceLedger = createEvidenceLedger(workspaceAccess);
 	refreshCompactionBudget();
-	openAiClient = createOpenAiClient({ endpoint, apiKey, model, tools });
+	openAiClient = createOpenAiClient({ endpoint, apiKey, model, tools, timeoutMs });
 	configuredModelDefaults = { contextWindow, inputModalities: [...inputModalities] };
 	if (terminalMode !== "off") {
 		tools.push({
@@ -563,18 +566,106 @@ async function runInterruptibleModelOperation(operation, onAbort) {
 	}
 }
 
+const ENDPOINT_RECOVERY_DELAYS_MS = [5_000, 15_000, 30_000];
+// Una respuesta no-streaming suele ser el runner de Ollama muerto o reiniciándose; ese trance puede tardar minutos.
+const SHAPE_RECOVERY_DELAYS_MS = [10_000, 20_000, 40_000, 60_000, 60_000];
+
+function isRecoverableEndpointError(error, emittedDeltas) {
+	if (error?.code === "ENDPOINT_SHAPE") return true;
+	if (Number.isInteger(error?.httpStatus)) return error.httpStatus === 429 || error.httpStatus >= 500;
+	if (error?.code === "ENDPOINT_CONNECT") return true;
+	if (error?.code === "STREAM_ENDED" || error?.code === "STREAM_ERROR") return emittedDeltas === 0;
+	if (error?.name === "AbortError" || error?.name === "TimeoutError") return true;
+	return false;
+}
+
+async function reloadEndpointFromEnv() {
+	try {
+		const config = await loadConfiguration({ appDirectory, env: {} });
+		const nextEndpoint = config.endpoint;
+		// Nunca cambiar a la API pública de OpenAI por accidente (falta OPENAI_BASE_URL en el .env).
+		if (nextEndpoint === "https://api.openai.com/v1/chat/completions" && endpoint !== nextEndpoint) return false;
+		if (nextEndpoint === endpoint && config.apiKey === apiKey && config.timeoutMs === timeoutMs) return false;
+		endpoint = nextEndpoint;
+		apiKey = config.apiKey;
+		timeoutMs = config.timeoutMs;
+		openAiClient = createOpenAiClient({ endpoint, apiKey, model, tools, timeoutMs });
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function applyFallbackEndpoint() {
+	for (const base of ollamaBasesForEndpoint(endpoint)) {
+		const candidate = base.endsWith("/chat/completions") ? base : `${base.replace(/\/+$/, "")}/v1/chat/completions`;
+		if (candidate === endpoint) continue;
+		endpoint = candidate;
+		openAiClient = createOpenAiClient({ endpoint, apiKey, model, tools, timeoutMs });
+		return true;
+	}
+	return false;
+}
+
+function abortableSleep(ms, signal) {
+	if (signal?.aborted) return Promise.reject(signal.reason ?? new DOMException("The operation was aborted.", "AbortError"));
+	return new Promise((resolve, reject) => {
+		const timer = setTimeout(() => {
+			signal?.removeEventListener("abort", onAbort);
+			resolve();
+		}, ms);
+		const onAbort = () => {
+			clearTimeout(timer);
+			reject(signal.reason ?? new DOMException("The operation was aborted.", "AbortError"));
+		};
+		signal?.addEventListener("abort", onAbort, { once: true });
+	});
+}
+
+async function recoverEndpoint(error, attempt, delays) {
+	if (await reloadEndpointFromEnv()) {
+		uiPrint(uiText(`· Configuración recargada del .env (endpoint: ${endpoint}); reintentando…`, "warning"));
+		return 0;
+	}
+	if (error?.code === "ENDPOINT_SHAPE" && applyFallbackEndpoint()) {
+		uiPrint(uiText(`· El endpoint no sirve streaming; usando Ollama directo (${endpoint}); reintentando…`, "warning"));
+		return 0;
+	}
+	return delays[Math.min(attempt, delays.length - 1)];
+}
+
 async function callChatCompletions(requestMessages, options = {}) {
 	activeModelRequestInFlight = true;
 	setPersistentUiActivity(options.withTools ? "Model generating" : "Model summarizing");
+	const requestOptions = {
+		...options,
+		maxTokens: options.maxTokens ? Math.min(options.maxTokens, compactionReserveTokens) : undefined,
+		...(options.withTools ? { availableTools: options.availableTools
+			? activeTools().filter((tool) => options.availableTools.some((allowed) => allowed.function?.name === tool.function?.name))
+			: activeTools() } : {}),
+		signal: options.signal ?? activeModelOperationController?.signal,
+	};
+	let emittedDeltas = 0;
+	for (const key of ["onTextDelta", "onReasoningDelta", "onToolCallDelta"]) {
+		const callback = requestOptions[key];
+		if (typeof callback === "function") requestOptions[key] = (payload) => { emittedDeltas += 1; callback(payload); };
+	}
 	try {
-		return await openAiClient.complete(requestMessages, {
-			...options,
-			maxTokens: options.maxTokens ? Math.min(options.maxTokens, compactionReserveTokens) : undefined,
-			...(options.withTools ? { availableTools: options.availableTools
-				? activeTools().filter((tool) => options.availableTools.some((allowed) => allowed.function?.name === tool.function?.name))
-				: activeTools() } : {}),
-			signal: options.signal ?? activeModelOperationController?.signal,
-		});
+		for (let attempt = 0; ; attempt += 1) {
+			try {
+				return await openAiClient.complete(requestMessages, requestOptions);
+			} catch (error) {
+				if (requestOptions.signal?.aborted) throw error;
+				const delays = error?.code === "ENDPOINT_SHAPE" ? SHAPE_RECOVERY_DELAYS_MS : ENDPOINT_RECOVERY_DELAYS_MS;
+				if (!isRecoverableEndpointError(error, emittedDeltas) || attempt >= delays.length) throw error;
+				const delayMs = await recoverEndpoint(error, attempt, delays);
+				if (delayMs > 0) {
+					const kind = error?.code === "ENDPOINT_SHAPE" ? "Respuesta no-streaming de" : "Endpoint inestable:";
+					uiPrint(uiText(`· ${kind} ${endpoint} (${String(error?.message ?? error).slice(0, 70)}); reintento ${attempt + 1}/${delays.length} en ${delayMs / 1000}s…`, "warning"));
+					await abortableSleep(delayMs, requestOptions.signal);
+				}
+			}
+		}
 	} finally {
 		activeModelRequestInFlight = false;
 	}
@@ -1167,14 +1258,20 @@ async function main() {
 						return;
 					}
 					const settings = modelSettings(entry, configuredModelDefaults, messages);
-					const nextClient = createOpenAiClient({ endpoint, apiKey, model: selected, tools });
+					const nextClient = createOpenAiClient({ endpoint, apiKey, model: selected, tools, timeoutMs });
 					model = selected;
 					openAiClient = nextClient;
 					contextWindow = settings.contextWindow;
 					inputModalities = settings.inputModalities;
 					refreshCompactionBudget();
 					resetContextUsage();
-					uiPrint(uiText(`Model switched to ${model} for this session.`, "success", true));
+					uiPrint(uiText(`Model switched to ${model}.`, "success", true));
+					try {
+						await persistModelDefault(applicationRoot, model);
+						uiPrint(uiText("· saved as default in .env", "muted"));
+					} catch (error) {
+						uiPrint(uiText(`· could not save default: ${error.message}`, "warning"));
+					}
 					if (!settings.knownContext) uiPrint(uiText(`Context size not supplied by the API; using configured ${tokenCount(contextWindow)} tokens.`, "muted"));
 					if (!settings.knownInput) uiPrint(uiText(`Input capabilities not supplied by the API; using configured ${inputModalities.join(", ")}.`, "muted"));
 					renderPersistentFooter();

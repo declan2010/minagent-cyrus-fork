@@ -4,6 +4,40 @@ const DEFAULT_TIMEOUT_MS = 60 * 60 * 1000;
 const DEFAULT_MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
 const MAX_TOOL_ARGUMENT_CHARS = 1024 * 1024;
 const RETRYABLE_NETWORK_ERRORS = new Set(["ECONNRESET", "ECONNREFUSED", "EPIPE", "ETIMEDOUT", "UND_ERR_CONNECT_TIMEOUT"]);
+const GLOBAL_DISPATCHER_KEY = Symbol.for("undici.globalDispatcher.1");
+let dispatcherProbed = false;
+
+function applyIdleTimeoutsIn(node, seen, idleMs) {
+	if (!node || typeof node !== "object" || seen.has(node)) return;
+	seen.add(node);
+	for (const sym of Object.getOwnPropertySymbols(node)) {
+		const desc = sym.description ?? "";
+		const value = node[sym];
+		if (desc === "body timeout" || desc === "headers timeout") {
+			node[sym] = idleMs;
+		} else if (desc === "options" && value && typeof value === "object" && !Array.isArray(value)) {
+			value.headersTimeout = idleMs;
+			value.bodyTimeout = idleMs;
+		} else if (desc === "clients" && value) {
+			if (value instanceof Map) {
+				for (const child of value.values()) applyIdleTimeoutsIn(child, seen, idleMs);
+			} else if (Array.isArray(value)) {
+				for (const child of value) applyIdleTimeoutsIn(child, seen, idleMs);
+			}
+		}
+	}
+}
+
+async function configureIdleTimeouts(idleMs) {
+	if (!globalThis[GLOBAL_DISPATCHER_KEY] && !dispatcherProbed) {
+		try {
+			await globalThis.fetch("http://127.0.0.1:1/", { signal: AbortSignal.timeout(50) });
+		} catch {}
+		dispatcherProbed = true;
+	}
+	const root = globalThis[GLOBAL_DISPATCHER_KEY];
+	if (root) applyIdleTimeoutsIn(root, new Set(), idleMs);
+}
 
 export function createOpenAiClient({ endpoint, apiKey, model, tools, timeoutMs = DEFAULT_TIMEOUT_MS, maxResponseBytes = DEFAULT_MAX_RESPONSE_BYTES }) {
 	if (!endpoint || !model || !Array.isArray(tools)) throw new Error("OpenAI client configuration is incomplete.");
@@ -26,6 +60,7 @@ export function createOpenAiClient({ endpoint, apiKey, model, tools, timeoutMs =
 			return normalizeModelCatalog(payload);
 		},
 		complete: async (requestMessages, options = {}) => {
+			await configureIdleTimeouts(timeoutMs);
 			const headers = { "Content-Type": "application/json" };
 			if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
 			const requestBody = { model, messages: requestMessages, stream: true };
@@ -57,19 +92,19 @@ export function createOpenAiClient({ endpoint, apiKey, model, tools, timeoutMs =
 						continue;
 					}
 					const cause = code ? ` (${code})` : error?.cause?.message ? ` (${error.cause.message})` : "";
-					throw new Error(`Could not connect to the OpenAI-compatible endpoint: ${error.message}${cause}`);
+					throw Object.assign(new Error(`Could not connect to the OpenAI-compatible endpoint: ${error.message}${cause}`), { code: "ENDPOINT_CONNECT" });
 				}
 			}
 			if (!response.ok) {
 				const bodyText = await readResponsePrefix(response, 8 * 1024, options.signal);
-				throw new Error(`Endpoint returned HTTP ${response.status}: ${bodyText}`);
+				throw Object.assign(new Error(`Endpoint returned HTTP ${response.status}: ${bodyText}`), { code: "HTTP_ERROR", httpStatus: response.status });
 			}
 			const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
 			if (contentType.includes("text/event-stream")) {
 				return readStreamingResponse(response, options.onTextDelta, maxResponseBytes, options.onReasoningDelta, options.signal, options.onToolCallDelta);
 			}
 			const bodyText = await readResponsePrefix(response, 2 * 1024, options.signal);
-			throw new Error(`The endpoint did not return a streaming response (Content-Type: ${contentType || "unknown"}). Response: ${bodyText}`);
+			throw Object.assign(new Error(`The endpoint did not return a streaming response (Content-Type: ${contentType || "unknown"}). Response: ${bodyText}`), { code: "ENDPOINT_SHAPE" });
 		},
 	};
 }
@@ -149,7 +184,7 @@ export async function readStreamingResponse(response, onTextDelta, maxResponseBy
 		}
 		if (event?.error) {
 			const detail = typeof event.error === "string" ? event.error : JSON.stringify(event.error);
-			throw new Error(`Endpoint streaming error: ${detail.slice(0, 1000)}`);
+			throw Object.assign(new Error(`Endpoint streaming error: ${detail.slice(0, 1000)}`), { code: "STREAM_ERROR" });
 		}
 		if (event?.usage) usage = event.usage;
 		const choice = event?.choices?.[0];
@@ -211,7 +246,7 @@ export async function readStreamingResponse(response, onTextDelta, maxResponseBy
 		}
 		buffer += decoder.decode();
 		if (buffer.trim()) consumeFrame(buffer);
-		if (!finished && !finishReason) throw new Error("Endpoint stream ended before a complete response was received.");
+		if (!finished && !finishReason) throw Object.assign(new Error("Endpoint stream ended before a complete response was received."), { code: "STREAM_ENDED" });
 	} catch (error) {
 		if (signal?.aborted) interrupted = true;
 		else throw error;
