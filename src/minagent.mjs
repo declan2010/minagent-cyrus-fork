@@ -42,6 +42,7 @@ let apiKey;
 let model;
 let contextWindow;
 let timeoutMs;
+let ollamaThink;
 let evidenceLedger;
 let inputModalities;
 let compactionReserveTokens;
@@ -175,6 +176,7 @@ async function initializeConfiguration() {
 		model,
 		contextWindow,
 		timeoutMs,
+		ollamaThink,
 		inputModalities,
 		terminalMode,
 		terminalCommandShell,
@@ -192,7 +194,7 @@ async function initializeConfiguration() {
 	workspaceAccess = createWorkspaceAccess(rootDirectory, workspaceName);
 	evidenceLedger = createEvidenceLedger(workspaceAccess);
 	refreshCompactionBudget();
-	openAiClient = createOpenAiClient({ endpoint, apiKey, model, tools, timeoutMs });
+	openAiClient = createOpenAiClient({ endpoint, apiKey, model, tools, timeoutMs, ollamaThink });
 	configuredModelDefaults = { contextWindow, inputModalities: [...inputModalities] };
 	if (terminalMode !== "off") {
 		tools.push({
@@ -585,11 +587,12 @@ async function reloadEndpointFromEnv() {
 		const nextEndpoint = config.endpoint;
 		// Nunca cambiar a la API pública de OpenAI por accidente (falta OPENAI_BASE_URL en el .env).
 		if (nextEndpoint === "https://api.openai.com/v1/chat/completions" && endpoint !== nextEndpoint) return false;
-		if (nextEndpoint === endpoint && config.apiKey === apiKey && config.timeoutMs === timeoutMs) return false;
+		if (nextEndpoint === endpoint && config.apiKey === apiKey && config.timeoutMs === timeoutMs && config.ollamaThink === ollamaThink) return false;
 		endpoint = nextEndpoint;
 		apiKey = config.apiKey;
 		timeoutMs = config.timeoutMs;
-		openAiClient = createOpenAiClient({ endpoint, apiKey, model, tools, timeoutMs });
+		ollamaThink = config.ollamaThink;
+		openAiClient = createOpenAiClient({ endpoint, apiKey, model, tools, timeoutMs, ollamaThink });
 		return true;
 	} catch {
 		return false;
@@ -601,7 +604,7 @@ function applyFallbackEndpoint() {
 		const candidate = base.endsWith("/chat/completions") ? base : `${base.replace(/\/+$/, "")}/v1/chat/completions`;
 		if (candidate === endpoint) continue;
 		endpoint = candidate;
-		openAiClient = createOpenAiClient({ endpoint, apiKey, model, tools, timeoutMs });
+		openAiClient = createOpenAiClient({ endpoint, apiKey, model, tools, timeoutMs, ollamaThink });
 		return true;
 	}
 	return false;
@@ -1258,7 +1261,7 @@ async function main() {
 						return;
 					}
 					const settings = modelSettings(entry, configuredModelDefaults, messages);
-					const nextClient = createOpenAiClient({ endpoint, apiKey, model: selected, tools, timeoutMs });
+					const nextClient = createOpenAiClient({ endpoint, apiKey, model: selected, tools, timeoutMs, ollamaThink });
 					model = selected;
 					openAiClient = nextClient;
 					contextWindow = settings.contextWindow;

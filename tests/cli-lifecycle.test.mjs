@@ -47,7 +47,7 @@ if (${cancelSearch}) {
 await import(${JSON.stringify(entrypoint)});`;
 	const child = spawn(process.execPath, ["--input-type=module", "-e", driver], {
 		cwd: root, windowsHide: true,
-		env: { ...process.env, OPENAI_MODEL: "lifecycle-test", OPENAI_API_KEY: "lifecycle-test", OPENAI_BASE_URL: "http://127.0.0.1:9/v1", MCP_MODE: "off", SKILLS_MODE: "off", TERMINAL_MODE: "off", NO_COLOR: "1", ...env },
+		env: { ...process.env, OPENAI_MODEL: "lifecycle-test", OPENAI_API_KEY: "lifecycle-test", OPENAI_BASE_URL: "http://127.0.0.1:9/v1", OPENAI_OLLAMA_THINK: "", MCP_MODE: "off", SKILLS_MODE: "off", TERMINAL_MODE: "off", NO_COLOR: "1", ...env },
 	});
 	let output = "", errors = "";
 	child.stdout.on("data", (chunk) => { output += chunk; });

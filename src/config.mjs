@@ -42,6 +42,16 @@ function parseNonNegativeInteger(value, name, fallback) {
 	return parsed;
 }
 
+function parseOllamaThink(value) {
+	if (value === undefined || value.trim() === "") return undefined;
+	const normalized = value.trim().toLowerCase();
+	const aliases = { off: "false", no: "false", none: "false", on: "true", yes: "true" };
+	const mapped = aliases[normalized] ?? normalized;
+	const allowed = ["false", "true", "low", "medium", "high", "xhigh", "max"];
+	if (!allowed.includes(mapped)) throw new Error(`OPENAI_OLLAMA_THINK must be one of: ${allowed.join(", ")} (aliases: off, on, no, yes).`);
+	return mapped;
+}
+
 function parsePermissionMode(value, name, fallback) {
 	const normalized = (value || fallback).trim();
 	if (!["auto", "ask", "off"].includes(normalized)) throw new Error(`${name} must be lowercase: auto, ask, or off.`);
@@ -99,6 +109,7 @@ export async function loadConfiguration({ appDirectory, cwd = process.cwd(), env
 		workspaceName: basename(rootDirectory) || "workspace",
 		endpoint: makeEndpoint(env.OPENAI_BASE_URL || "https://api.openai.com/v1"),
 		apiKey: env.OPENAI_API_KEY?.trim(),
+		ollamaThink: parseOllamaThink(env.OPENAI_OLLAMA_THINK),
 		model,
 		contextWindow,
 		timeoutMs,

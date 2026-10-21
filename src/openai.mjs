@@ -39,7 +39,7 @@ async function configureIdleTimeouts(idleMs) {
 	if (root) applyIdleTimeoutsIn(root, new Set(), idleMs);
 }
 
-export function createOpenAiClient({ endpoint, apiKey, model, tools, timeoutMs = DEFAULT_TIMEOUT_MS, maxResponseBytes = DEFAULT_MAX_RESPONSE_BYTES }) {
+export function createOpenAiClient({ endpoint, apiKey, model, tools, timeoutMs = DEFAULT_TIMEOUT_MS, maxResponseBytes = DEFAULT_MAX_RESPONSE_BYTES, ollamaThink }) {
 	if (!endpoint || !model || !Array.isArray(tools)) throw new Error("OpenAI client configuration is incomplete.");
 	return {
 		listModels: async ({ signal, timeoutMs: catalogTimeoutMs = 15_000 } = {}) => {
@@ -63,12 +63,19 @@ export function createOpenAiClient({ endpoint, apiKey, model, tools, timeoutMs =
 			await configureIdleTimeouts(timeoutMs);
 			const headers = { "Content-Type": "application/json" };
 			if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
-			const requestBody = { model, messages: requestMessages, stream: true };
+			// OPENAI_OLLAMA_THINK activa el modo nativo de Ollama (/api/chat), único canal que entiende "think".
+			const nativeTarget = ollamaThink === undefined ? undefined : ollamaChatUrl(endpoint);
+			const requestBody = nativeTarget
+				? { model, messages: toOllamaMessages(requestMessages), stream: true, think: ollamaThinkValue(ollamaThink) }
+				: { model, messages: requestMessages, stream: true };
 			if (options.withTools) {
 				requestBody.tools = options.availableTools ?? tools;
 				requestBody.tool_choice = options.toolChoice ?? "auto";
 			}
-			if (options.maxTokens) requestBody.max_tokens = options.maxTokens;
+			if (options.maxTokens) {
+				if (nativeTarget) requestBody.options = { num_predict: options.maxTokens };
+				else requestBody.max_tokens = options.maxTokens;
+			}
 			const signals = [];
 			if (options.signal) signals.push(options.signal);
 			if (timeoutMs > 0) signals.push(AbortSignal.timeout(timeoutMs));
@@ -76,7 +83,7 @@ export function createOpenAiClient({ endpoint, apiKey, model, tools, timeoutMs =
 			let response;
 			for (let attempt = 0; attempt < 2; attempt += 1) {
 				try {
-					response = await fetch(endpoint, {
+					response = await fetch(nativeTarget ?? endpoint, {
 						method: "POST",
 						headers,
 						body: JSON.stringify(requestBody),
@@ -100,13 +107,63 @@ export function createOpenAiClient({ endpoint, apiKey, model, tools, timeoutMs =
 				throw Object.assign(new Error(`Endpoint returned HTTP ${response.status}: ${bodyText}`), { code: "HTTP_ERROR", httpStatus: response.status });
 			}
 			const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
-			if (contentType.includes("text/event-stream")) {
+			if (nativeTarget) {
+				// Ollama nativo responde NDJSON; JSON o SSE significan otra cosa (runner caído, proxy raro…).
+				if (!contentType.includes("application/json") && !contentType.includes("text/event-stream")) {
+					return readOllamaStreamingResponse(response, options.onTextDelta, maxResponseBytes, options.onReasoningDelta, options.signal, options.onToolCallDelta);
+				}
+			} else if (contentType.includes("text/event-stream")) {
 				return readStreamingResponse(response, options.onTextDelta, maxResponseBytes, options.onReasoningDelta, options.signal, options.onToolCallDelta);
 			}
 			const bodyText = await readResponsePrefix(response, 2 * 1024, options.signal);
-			throw Object.assign(new Error(`The endpoint did not return a streaming response (Content-Type: ${contentType || "unknown"}). Response: ${bodyText}`), { code: "ENDPOINT_SHAPE" });
+			const expected = nativeTarget ? "streaming NDJSON" : "streaming";
+			throw Object.assign(new Error(`The endpoint did not return a ${expected} response (Content-Type: ${contentType || "unknown"}). Response: ${bodyText}`), { code: "ENDPOINT_SHAPE" });
 		},
 	};
+}
+
+// Convierte un endpoint .../v1/chat/completions en .../api/chat sobre el mismo host.
+function ollamaChatUrl(endpoint) {
+	try {
+		const url = new URL(endpoint);
+		let path = url.pathname.replace(/\/+$/, "").replace(/\/chat\/completions$/, "").replace(/\/v1$/, "");
+		return `${url.origin}${path}/api/chat`;
+	} catch {
+		return undefined;
+	}
+}
+
+function ollamaThinkValue(level) {
+	if (level === "false") return false;
+	if (level === "true") return true;
+	return level;
+}
+
+// Ajusta mensajes OpenAI al formato nativo de Ollama: tool_calls sin id/type y contenido no-string serializado.
+// El renderer custom exige arguments como OBJETO JSON (string crudo → HTTP 400 "can't find closing '}'").
+function toOllamaMessages(messages) {
+	return messages.map((message) => {
+		const mapped = { ...message };
+		if (mapped.role === "developer") mapped.role = "system";
+		if (mapped.content != null && typeof mapped.content !== "string" && !Array.isArray(mapped.content)) {
+			mapped.content = JSON.stringify(mapped.content);
+		}
+		if (Array.isArray(message.tool_calls)) {
+			mapped.tool_calls = message.tool_calls.map((call) => {
+				const raw = call?.function?.arguments;
+				let parsed;
+				if (raw && typeof raw === "object" && !Array.isArray(raw)) parsed = raw;
+				else if (typeof raw === "string") {
+					try { parsed = JSON.parse(raw); } catch { parsed = undefined; }
+					if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) parsed = undefined;
+				}
+				const fn = { name: call?.function?.name ?? "" };
+				if (parsed !== undefined) fn.arguments = parsed;
+				return { function: fn };
+			});
+		}
+		return mapped;
+	});
 }
 
 function waitForRetryDelay(signal) {
@@ -269,6 +326,133 @@ export async function readStreamingResponse(response, onTextDelta, maxResponseBy
 	if (finishReason === "content_filter") throw new Error("Endpoint stopped the response because of its content filter.");
 	for (const call of message.tool_calls ?? []) {
 		if (!call.id || !call.function.name) throw Object.assign(new Error("Endpoint returned an incomplete tool call."), { code: "INVALID_TOOL_CALL" });
+		try {
+			const args = JSON.parse(call.function.arguments);
+			if (!args || typeof args !== "object" || Array.isArray(args)) throw new Error();
+		} catch {
+			throw Object.assign(new Error(`Endpoint returned invalid arguments for tool ${call.function.name}.`), { code: "INVALID_TOOL_CALL" });
+		}
+	}
+	return { payload: { usage, finish_reason: finishReason }, message };
+}
+
+// Parser NDJSON para /api/chat de Ollama: un JSON por línea; el chunk final lleva done:true y las estadísticas.
+export async function readOllamaStreamingResponse(response, onTextDelta, maxResponseBytes = DEFAULT_MAX_RESPONSE_BYTES, onReasoningDelta, signal, onToolCallDelta) {
+	if (!response.body) throw new Error("Endpoint opened a streaming response without a readable body.");
+	const reader = response.body.getReader();
+	const decoder = new TextDecoder();
+	const toolCalls = new Map();
+	let buffer = "";
+	let content = "";
+	let usage;
+	let finishReason;
+	let finished = false;
+	let bytesRead = 0;
+	let bodyDone = false;
+	let interrupted = false;
+
+	function consumeLine(line) {
+		const trimmed = line.trim();
+		if (!trimmed) return;
+		let event;
+		try {
+			event = JSON.parse(trimmed);
+		} catch {
+			throw new Error("Endpoint sent an invalid streaming event.");
+		}
+		if (event?.error) {
+			const detail = typeof event.error === "string" ? event.error : JSON.stringify(event.error);
+			throw Object.assign(new Error(`Endpoint streaming error: ${detail.slice(0, 1000)}`), { code: "STREAM_ERROR" });
+		}
+		// El mensaje se procesa aunque venga en el chunk done (algunos builds mandan contenido ahí al final).
+		const message = event?.message;
+		if (message && typeof message === "object") {
+			if (typeof message.thinking === "string" && message.thinking) onReasoningDelta?.(message.thinking);
+			if (typeof message.content === "string" && message.content) {
+				content += message.content;
+				onTextDelta?.(message.content);
+			}
+			const calls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
+			for (const [position, incoming] of calls.entries()) {
+				const index = Number.isInteger(incoming?.index) ? incoming.index : position;
+				const name = typeof incoming?.function?.name === "string" ? incoming.function.name : "";
+				const rawArgs = incoming?.function?.arguments;
+				const args = typeof rawArgs === "string" ? rawArgs : rawArgs === undefined ? "" : JSON.stringify(rawArgs);
+				const existing = toolCalls.get(index);
+				if (existing && name.startsWith(existing.function.name) && args.startsWith(existing.function.arguments)) {
+					// El chunk repite la llamada completa hasta ahora (acumulada); reemplazar en vez de duplicar.
+					existing.function.name = name;
+					existing.function.arguments = args;
+				} else {
+					const call = existing ?? { id: `call_${index}`, type: "function", function: { name: "", arguments: "" } };
+					call.function.name += name;
+					call.function.arguments += args;
+					if (call.function.arguments.length > MAX_TOOL_ARGUMENT_CHARS) throw new Error("Endpoint returned tool arguments larger than the 1 MiB limit.");
+					toolCalls.set(index, call);
+				}
+				onToolCallDelta?.({ index, name: toolCalls.get(index).function.name });
+			}
+		}
+		if (event?.done) {
+			finished = true;
+			if (typeof event.done_reason === "string" && event.done_reason) finishReason = event.done_reason === "abort" ? "aborted" : event.done_reason;
+			const promptTokens = Number.isFinite(event.prompt_eval_count) ? event.prompt_eval_count : undefined;
+			const completionTokens = Number.isFinite(event.eval_count) ? event.eval_count : undefined;
+			if (promptTokens !== undefined || completionTokens !== undefined) {
+				usage = {
+					prompt_tokens: promptTokens ?? 0,
+					completion_tokens: completionTokens ?? 0,
+					total_tokens: (promptTokens ?? 0) + (completionTokens ?? 0),
+				};
+			}
+		}
+	}
+
+	try {
+		while (!finished) {
+			const { value, done } = await reader.read();
+			if (done) {
+				bodyDone = true;
+				break;
+			}
+			bytesRead += value.byteLength;
+			if (bytesRead > maxResponseBytes) throw new Error(`Endpoint streaming response exceeds the ${maxResponseBytes} byte limit.`);
+			buffer += decoder.decode(value, { stream: true });
+			let newline;
+			while ((newline = buffer.indexOf("\n")) !== -1) {
+				const line = buffer.slice(0, newline);
+				buffer = buffer.slice(newline + 1);
+				consumeLine(line);
+				if (finished) break;
+			}
+		}
+		if (!finished) {
+			buffer += decoder.decode();
+			if (buffer.trim()) consumeLine(buffer);
+		}
+		if (!finished && !finishReason) throw Object.assign(new Error("Endpoint stream ended before a complete response was received."), { code: "STREAM_ENDED" });
+	} catch (error) {
+		if (signal?.aborted) interrupted = true;
+		else throw error;
+	} finally {
+		if (!bodyDone) await reader.cancel().catch(() => {});
+		reader.releaseLock();
+	}
+	if (interrupted) {
+		return {
+			payload: { usage, finish_reason: "aborted" },
+			message: { role: "assistant", content: content || null, interrupted: true },
+		};
+	}
+
+	const message = { role: "assistant", content: content || null };
+	if (toolCalls.size > 0) message.tool_calls = [...toolCalls.entries()]
+		.sort(([left], [right]) => left - right)
+		.map(([, call]) => call);
+	if (finishReason === "length") throw new Error("Endpoint stopped at its output token limit; the partial response was discarded.");
+	if (finishReason === "content_filter") throw new Error("Endpoint stopped the response because of its content filter.");
+	for (const call of message.tool_calls ?? []) {
+		if (!call.function.name) throw Object.assign(new Error("Endpoint returned an incomplete tool call."), { code: "INVALID_TOOL_CALL" });
 		try {
 			const args = JSON.parse(call.function.arguments);
 			if (!args || typeof args !== "object" || Array.isArray(args)) throw new Error();
