@@ -46,6 +46,22 @@ export function handleModeKeypress(key) {
 	return true;
 }
 
+export const THINK_CYCLE_LEVELS = ["false", "low", "medium", "high"];
+
+export function nextThinkLevel(current) {
+	const index = THINK_CYCLE_LEVELS.indexOf(current);
+	return THINK_CYCLE_LEVELS[(index + 1) % THINK_CYCLE_LEVELS.length];
+}
+
+export function handleThinkKeypress(key) {
+	if (!key || key.name !== "t" || !key.ctrl || key.meta) return false;
+	// Inertizar la tecla para que readline no ejecute su binding por defecto (transpose).
+	key.name = "unbound";
+	key.ctrl = false;
+	key.meta = false;
+	return true;
+}
+
 export function handleModelSelectorKeypress(state, key) {
 	if (!state || !key || (key.ctrl && key.name === "c")) return null;
 	const name = key.name;

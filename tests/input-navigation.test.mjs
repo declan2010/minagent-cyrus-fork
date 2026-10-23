@@ -4,6 +4,22 @@ import { createInterface } from "node:readline/promises";
 import { PassThrough } from "node:stream";
 import { layoutInput } from "../src/input-layout.mjs";
 import { handleVerticalInput, handleAutocompleteKeypress, buildAutocompleteState } from "../src/editor.mjs";
+import { nextThinkLevel, handleThinkKeypress } from "../src/editor.mjs";
+
+test("think level cycles off → low → medium → high → off and Ctrl+T is inert for readline", () => {
+	assert.equal(nextThinkLevel("false"), "low");
+	assert.equal(nextThinkLevel("low"), "medium");
+	assert.equal(nextThinkLevel("medium"), "high");
+	assert.equal(nextThinkLevel("high"), "false");
+	assert.equal(nextThinkLevel(undefined), "false");
+	assert.equal(nextThinkLevel("xhigh"), "false");
+	const key = { name: "t", ctrl: true, meta: false };
+	assert.equal(handleThinkKeypress(key), true);
+	assert.equal(key.name, "unbound");
+	assert.equal(handleThinkKeypress({ name: "t" }), false);
+	assert.equal(handleThinkKeypress({ name: "t", meta: true }), false);
+	assert.equal(handleThinkKeypress({ name: "x", ctrl: true }), false);
+});
 import { insertNewline } from "../src/readline-adapter.mjs";
 
 function editor(line, cursor = line.length, options = { prompt: "", columns: 80 }) {

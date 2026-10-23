@@ -11,7 +11,7 @@ import { runTerminalCommand as executeTerminalCommand } from "./terminal-command
 import { requestToolPermission } from "./tool-permissions.mjs";
 import { approvalPreview, redactLikelySecrets } from "./secrets.mjs";
 import { createOpenAiClient } from "./openai.mjs";
-import { buildAutocompleteState, formatAutocompletePanel, handleAutocompleteKeypress, handleControlJInput, handlePastedInput, handleVerticalInput, handleModelSelectorKeypress, handleModeKeypress } from "./editor.mjs";
+import { buildAutocompleteState, formatAutocompletePanel, handleAutocompleteKeypress, handleControlJInput, handlePastedInput, handleVerticalInput, handleModelSelectorKeypress, handleModeKeypress, handleThinkKeypress, nextThinkLevel } from "./editor.mjs";
 import { modelSettings } from "./models.mjs";
 import { ollamaBasesForEndpoint, persistModelDefault } from "./model-switch.mjs";
 import { toolsForMode, executeModeTool, assertModeCommand, createAgentModeState, modeInputPrompt } from "./agent-mode.mjs";
@@ -139,12 +139,13 @@ function renderPersistentFooter() {
 	const status = [
 		...(agentMode.running && agentMode.running !== agentMode.selected ? [uiText(`Running: ${agentMode.running === "plan" ? "Plan" : "Build"}`, "cyan")] : []),
 		uiText(model, "magenta", true),
+		...(thinkControlAvailable() ? [uiText(`think ${ollamaThinkLabel()}`, ollamaThink === undefined ? "muted" : ollamaThink === "false" ? "success" : "warning", true)] : []),
 		uiText(tokenCount(usage.used), "pale", true) + uiText(`/${tokenCount(contextWindow)} tokens`, "muted"),
 		uiText(`${usage.percent.toFixed(1)}% ${usageMeter(usage.percent, 10)}`, contextColor),
 		uiText(persistentUiActivity, activityColor, true),
 		...(persistentUiQueuedCount > 0 ? [uiText(`${persistentUiQueuedCount} queued`, "warning")] : []),
 	].join(separator);
-	const hints = [["Tab", "mode", "warning"], ["/", "commands", "magenta"], ["@", "files", "cyan"], ["Ctrl+J", "new line", "success"], ["Esc", "stop", "warning"]]
+	const hints = [["Tab", "mode", "warning"], ["Ctrl+T", "think", "cyan"], ["/", "commands", "magenta"], ["@", "files", "cyan"], ["Ctrl+J", "new line", "success"], ["Esc", "stop", "warning"]]
 		.map(([key, label, color]) => `${uiText(key, color, true)} ${uiText(label, "muted")}`).join("  ");
 	const line = safeTerminalText(terminal.line ?? "");
 	const cursor = Number.isInteger(terminal.cursor) ? Math.max(0, Math.min(terminal.cursor, line.length)) : line.length;
@@ -608,6 +609,22 @@ function applyFallbackEndpoint() {
 		return true;
 	}
 	return false;
+}
+
+// Ctrl+T solo tiene sentido contra un Ollama local (el modo nativo /api/chat).
+function thinkControlAvailable() {
+	try {
+		const { hostname } = new URL(endpoint);
+		return hostname === "127.0.0.1" || hostname === "localhost" || hostname === "::1";
+	} catch {
+		return false;
+	}
+}
+
+function ollamaThinkLabel() {
+	if (ollamaThink === undefined) return "auto";
+	if (ollamaThink === "false") return "off";
+	return ollamaThink;
 }
 
 function abortableSleep(ms, signal) {
@@ -1150,6 +1167,17 @@ async function main() {
 				key.meta = false;
 				if ((activeModelRequestInFlight || activeProjectInitialization || activeSearch) && !activeModelOperationController.signal.aborted) {
 					activeModelOperationController.abort();
+				}
+				return;
+			}
+			if (handleThinkKeypress(key) && !pendingApprovalResolver) {
+				if (!thinkControlAvailable()) {
+					uiPrint(uiText("· Ctrl+T solo controla el thinking con un endpoint Ollama local.", "warning"));
+				} else {
+					ollamaThink = nextThinkLevel(ollamaThink);
+					openAiClient = createOpenAiClient({ endpoint, apiKey, model, tools, timeoutMs, ollamaThink });
+					renderPersistentFooter();
+					uiPrint(uiText(`· Thinking: ${ollamaThinkLabel()} · aplica en la próxima petición.`, "warning"));
 				}
 				return;
 			}
