@@ -78,7 +78,7 @@ test("native Ollama mode keeps the /v1 wire intact when the knob is off", async 
 	assert.equal(result.message.content, "ok");
 });
 
-test("native tool calls survive full-so-far chunks, get synthetic ids and round-trip without ids", async (t) => {
+test("native tool calls survive full-so-far chunks, get synthetic ids and round-trip keeping ids", async (t) => {
 	let captured;
 	const server = await listen(async (req, res) => {
 		let body = "";
@@ -106,9 +106,10 @@ test("native tool calls survive full-so-far chunks, get synthetic ids and round-
 	assert.equal(result.message.tool_calls[0].function.arguments, '{"command":"ls"}');
 	assert.equal(result.message.tool_calls[0].id, "call_0");
 	assert.equal(result.payload.finish_reason, "tool_calls");
-	// Round-trip: tool_calls sin id/type, arguments como objeto (exigencia del renderer custom).
+	// Round-trip: arguments como objeto (exigencia del renderer custom) y id/type PRESERVADOS:
+	// el puente cloud asocia tool_call_id ↔ tool_call por id; sin id descarta el resultado.
 	const [, assistant, tool] = captured.messages;
-	assert.deepEqual(assistant.tool_calls, [{ function: { name: "run_terminal", arguments: { command: "ls" } } }]);
+	assert.deepEqual(assistant.tool_calls, [{ id: "call_abc", type: "function", function: { name: "run_terminal", arguments: { command: "ls" } } }]);
 	assert.equal(tool.role, "tool");
 	assert.equal(tool.content, "archivo.txt");
 });
@@ -165,6 +166,55 @@ test("native mode labels mid-stream errors and truncated streams for recovery", 
 		model: "qwen", tools: [], ollamaThink: "false",
 	});
 	await assert.rejects(jsonClient.complete([{ role: "user", content: "x" }]), { code: "ENDPOINT_SHAPE" });
+});
+
+test("cloud bridge: NDJSON stream labeled application/json parses as a native stream", async (t) => {
+	const server = await listen((req, res) => {
+		res.writeHead(200, { "Content-Type": "application/json" });
+		res.write(`${JSON.stringify({ model: "minimax-m3", message: { role: "assistant", thinking: "debo", content: "" }, done: false })}\n`);
+		res.write(`${JSON.stringify({ model: "minimax-m3", message: { role: "assistant", content: "Hola" }, done: false })}\n`);
+		res.write(`${JSON.stringify({ model: "minimax-m3", message: { role: "assistant", content: "!" }, done: true, done_reason: "stop", eval_count: 7, prompt_eval_count: 11 })}\n`);
+		res.end();
+	});
+	t.after(() => close(server));
+	const client = createOpenAiClient({
+		endpoint: `http://127.0.0.1:${server.address().port}/v1/chat/completions`,
+		model: "minimax-m3:cloud", tools: [], ollamaThink: "low",
+	});
+	const deltas = [];
+	const reasoning = [];
+	const result = await client.complete([{ role: "user", content: "hola" }], { onTextDelta: (chunk) => deltas.push(chunk), onReasoningDelta: (chunk) => reasoning.push(chunk) });
+	assert.deepEqual(deltas, ["Hola", "!"]);
+	assert.deepEqual(reasoning, ["debo"]);
+	assert.equal(result.message.content, "Hola!");
+	assert.equal(result.payload.finish_reason, "stop");
+	assert.deepEqual(result.payload.usage, { prompt_tokens: 11, completion_tokens: 7, total_tokens: 18 });
+});
+
+test("cloud bridge: a lone error keeps ENDPOINT_SHAPE, mid-stream errors stay STREAM_ERROR", async (t) => {
+	const lone = await listen((req, res) => {
+		res.writeHead(200, { "Content-Type": "application/json" });
+		res.end(`${JSON.stringify({ error: "runner muerto" })}\n`);
+	});
+	t.after(() => close(lone));
+	const loneClient = createOpenAiClient({
+		endpoint: `http://127.0.0.1:${lone.address().port}/v1/chat/completions`,
+		model: "qwen", tools: [], ollamaThink: "low",
+	});
+	await assert.rejects(loneClient.complete([{ role: "user", content: "x" }]), (error) => error.code === "ENDPOINT_SHAPE" && error.message.includes("runner muerto"));
+
+	const midStream = await listen((req, res) => {
+		res.writeHead(200, { "Content-Type": "application/json" });
+		res.write(`${JSON.stringify({ message: { role: "assistant", content: "par" }, done: false })}\n`);
+		res.write(`${JSON.stringify({ error: "upstream went away" })}\n`);
+		res.end();
+	});
+	t.after(() => close(midStream));
+	const midClient = createOpenAiClient({
+		endpoint: `http://127.0.0.1:${midStream.address().port}/v1/chat/completions`,
+		model: "qwen", tools: [], ollamaThink: "low",
+	});
+	await assert.rejects(midClient.complete([{ role: "user", content: "x" }]), (error) => error.code === "STREAM_ERROR" && error.message.includes("upstream went away"));
 });
 
 test("OPENAI_OLLAMA_THINK parsing accepts levels and aliases, rejects junk", async (t) => {

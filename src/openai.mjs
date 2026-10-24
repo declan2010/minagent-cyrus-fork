@@ -108,9 +108,10 @@ export function createOpenAiClient({ endpoint, apiKey, model, tools, timeoutMs =
 			}
 			const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
 			if (nativeTarget) {
-				// Ollama nativo responde NDJSON; JSON o SSE significan otra cosa (runner caído, proxy raro…).
-				if (!contentType.includes("application/json") && !contentType.includes("text/event-stream")) {
-					return readOllamaStreamingResponse(response, options.onTextDelta, maxResponseBytes, options.onReasoningDelta, options.signal, options.onToolCallDelta);
+				// Ollama nativo emite NDJSON; el puente cloud etiqueta su stream como application/json
+				// (mismo cuerpo, otra etiqueta). Solo SSE sobra en este camino.
+				if (!contentType.includes("text/event-stream")) {
+					return readOllamaStreamingResponse(response, options.onTextDelta, maxResponseBytes, options.onReasoningDelta, options.signal, options.onToolCallDelta, contentType);
 				}
 			} else if (contentType.includes("text/event-stream")) {
 				return readStreamingResponse(response, options.onTextDelta, maxResponseBytes, options.onReasoningDelta, options.signal, options.onToolCallDelta);
@@ -139,8 +140,9 @@ function ollamaThinkValue(level) {
 	return level;
 }
 
-// Ajusta mensajes OpenAI al formato nativo de Ollama: tool_calls sin id/type y contenido no-string serializado.
-// El renderer custom exige arguments como OBJETO JSON (string crudo → HTTP 400 "can't find closing '}'").
+// Ajusta mensajes OpenAI al formato nativo de Ollama: contenido no-string serializado, arguments como
+// OBJETO JSON (string crudo → HTTP 400 "can't find closing '}'"). id/type se PRESERVAN: el puente
+// cloud asocia el resultado (tool_call_id) con el tool_call por id — sin id, descarta el contenido.
 function toOllamaMessages(messages) {
 	return messages.map((message) => {
 		const mapped = { ...message };
@@ -159,7 +161,7 @@ function toOllamaMessages(messages) {
 				}
 				const fn = { name: call?.function?.name ?? "" };
 				if (parsed !== undefined) fn.arguments = parsed;
-				return { function: fn };
+				return { ...call, function: fn };
 			});
 		}
 		return mapped;
@@ -337,7 +339,7 @@ export async function readStreamingResponse(response, onTextDelta, maxResponseBy
 }
 
 // Parser NDJSON para /api/chat de Ollama: un JSON por línea; el chunk final lleva done:true y las estadísticas.
-export async function readOllamaStreamingResponse(response, onTextDelta, maxResponseBytes = DEFAULT_MAX_RESPONSE_BYTES, onReasoningDelta, signal, onToolCallDelta) {
+export async function readOllamaStreamingResponse(response, onTextDelta, maxResponseBytes = DEFAULT_MAX_RESPONSE_BYTES, onReasoningDelta, signal, onToolCallDelta, contentType = "") {
 	if (!response.body) throw new Error("Endpoint opened a streaming response without a readable body.");
 	const reader = response.body.getReader();
 	const decoder = new TextDecoder();
@@ -350,6 +352,7 @@ export async function readOllamaStreamingResponse(response, onTextDelta, maxResp
 	let bytesRead = 0;
 	let bodyDone = false;
 	let interrupted = false;
+	let sawDataLine = false;
 
 	function consumeLine(line) {
 		const trimmed = line.trim();
@@ -362,8 +365,12 @@ export async function readOllamaStreamingResponse(response, onTextDelta, maxResp
 		}
 		if (event?.error) {
 			const detail = typeof event.error === "string" ? event.error : JSON.stringify(event.error);
-			throw Object.assign(new Error(`Endpoint streaming error: ${detail.slice(0, 1000)}`), { code: "STREAM_ERROR" });
+			// Un error como PRIMERA línea con etiqueta application/json = la respuesta entera es el error
+			// (puente cloud / runner caído) → forma del endpoint. Dentro de un stream ya iniciado → STREAM_ERROR.
+			const code = sawDataLine || !contentType.includes("application/json") ? "STREAM_ERROR" : "ENDPOINT_SHAPE";
+			throw Object.assign(new Error(`Endpoint streaming error: ${detail.slice(0, 1000)}`), { code });
 		}
+		sawDataLine = true;
 		// El mensaje se procesa aunque venga en el chunk done (algunos builds mandan contenido ahí al final).
 		const message = event?.message;
 		if (message && typeof message === "object") {
