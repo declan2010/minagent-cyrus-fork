@@ -114,6 +114,80 @@ test("native tool calls survive full-so-far chunks, get synthetic ids and round-
 	assert.equal(tool.content, "archivo.txt");
 });
 
+test("synthesized tool call ids stay unique on the wire while keeping call↔result pairing", async (t) => {
+	// Los upstreams de nube renombrean tool_call ids por request (function calling); con ids
+	// sintetizados call_0/call_1 REPETIDOS entre rounds, atribuyen resultados al round equivocado.
+	const dupHistory = [
+		{ role: "user", content: "lista" },
+		{ role: "assistant", content: null, tool_calls: [{ id: "call_0", type: "function", function: { name: "run_terminal", arguments: '{"command":"ls"}' } }, { id: "call_1", type: "function", function: { name: "read_file", arguments: '{"path":"a"}' } }] },
+		{ role: "tool", tool_call_id: "call_0", content: "r1a" },
+		{ role: "tool", tool_call_id: "call_1", content: "r1b" },
+		{ role: "assistant", content: null, tool_calls: [{ id: "call_0", type: "function", function: { name: "run_terminal", arguments: '{"command":"date"}' } }, { id: "call_1", type: "function", function: { name: "read_file", arguments: '{"path":"b"}' } }] },
+		{ role: "tool", tool_call_id: "call_0", content: "r2a" },
+		{ role: "tool", tool_call_id: "call_1", content: "r2b" },
+		{ role: "assistant", content: null, tool_calls: [{ id: "call_0", type: "function", function: { name: "run_terminal", arguments: '{"command":"uptime"}' } }] },
+		{ role: "tool", tool_call_id: "call_0", content: "r3a" },
+	];
+
+	let captured;
+	const server = await listen(async (req, res) => {
+		let body = "";
+		for await (const chunk of req) body += chunk;
+		captured = JSON.parse(body);
+		ndjson(res, [{ message: { role: "assistant", content: "ok" }, done: true, done_reason: "stop" }]);
+	});
+	t.after(() => close(server));
+	const client = createOpenAiClient({
+		endpoint: `http://127.0.0.1:${server.address().port}/v1/chat/completions`,
+		model: "qwen", tools: [], ollamaThink: "low",
+	});
+	await client.complete(dupHistory, { withTools: true });
+
+	const sent = captured.messages;
+	const assistants = sent.filter((m) => Array.isArray(m.tool_calls));
+	const tools = sent.filter((m) => m.role === "tool");
+	// pares intactos: cada resultado cita el id de su llamada, renombrado igual en ambos lados
+	assert.deepEqual(assistants.map((m) => m.tool_calls.map((c) => c.id)), [
+		["call_0", "call_1"],
+		["call_0__d1", "call_1__d2"],
+		["call_0__d3"],
+	]);
+	assert.deepEqual(tools.map((m) => m.tool_call_id), ["call_0", "call_1", "call_0__d1", "call_1__d2", "call_0__d3"]);
+	// ids únicos ENTRE pares: ninguna llamada reutiliza el id de otra
+	const assistantIds = assistants.flatMap((m) => m.tool_calls.map((c) => c.id));
+	assert.equal(new Set(assistantIds).size, assistantIds.length);
+	// cada resultado apunta al id de SU llamada (recién renombrada)
+	assert.deepEqual(tools.map((m) => m.tool_call_id). slice(-1), ["call_0__d3"]);
+	// los arguments no se mutaron
+	assert.equal(assistants[0].tool_calls[0].function.arguments.command, "ls");
+	assert.equal(assistants[1].tool_calls[1].function.arguments.path, "b");
+	assert.equal(captured.think, "low");
+});
+
+test("single-pair tool histories are sent untouched by the id uniquifier", async (t) => {
+	// un call_0 único + su resultado: sin repeticiones, el transform no cambia nada
+	const single = [
+		{ role: "user", content: "x" },
+		{ role: "assistant", content: null, tool_calls: [{ id: "call_0", type: "function", function: { name: "read_file", arguments: '{"path":"a"}' } }] },
+		{ role: "tool", tool_call_id: "call_0", content: "r" },
+	];
+	let captured;
+	const server = await listen(async (req, res) => {
+		let body = "";
+		for await (const chunk of req) body += chunk;
+		captured = JSON.parse(body);
+		ndjson(res, [{ message: { role: "assistant", content: "ok" }, done: true, done_reason: "stop" }]);
+	});
+	t.after(() => close(server));
+	const client = createOpenAiClient({
+		endpoint: `http://127.0.0.1:${server.address().port}/v1/chat/completions`,
+		model: "qwen", tools: [], ollamaThink: "low",
+	});
+	await client.complete(single, { withTools: true });
+	assert.deepEqual(captured.messages[1].tool_calls, [{ id: "call_0", type: "function", function: { name: "read_file", arguments: { path: "a" } } }]);
+	assert.equal(captured.messages[2].tool_call_id, "call_0");
+});
+
 test("native streaming forwards thinking deltas and labels stream failures", async (t) => {
 	const server = await listen((req, res) => {
 		ndjson(res, [

@@ -66,8 +66,8 @@ export function createOpenAiClient({ endpoint, apiKey, model, tools, timeoutMs =
 			// OPENAI_OLLAMA_THINK activa el modo nativo de Ollama (/api/chat), único canal que entiende "think".
 			const nativeTarget = ollamaThink === undefined ? undefined : ollamaChatUrl(endpoint);
 			const requestBody = nativeTarget
-				? { model, messages: toOllamaMessages(requestMessages), stream: true, think: ollamaThinkValue(ollamaThink) }
-				: { model, messages: requestMessages, stream: true };
+				? { model, messages: uniqueToolCallIds(toOllamaMessages(requestMessages)), stream: true, think: ollamaThinkValue(ollamaThink) }
+				: { model, messages: uniqueToolCallIds(requestMessages), stream: true };
 			if (options.withTools) {
 				requestBody.tools = options.availableTools ?? tools;
 				requestBody.tool_choice = options.toolChoice ?? "auto";
@@ -138,6 +138,42 @@ function ollamaThinkValue(level) {
 	if (level === "false") return false;
 	if (level === "true") return true;
 	return level;
+}
+
+// Unifica ids de tool_calls en el flujo: los ids sintetizados (call_0, call_1 por posición)
+// se REPITEN entre rounds y el upstream de nubes renombra ids por request (function calling);
+// con colisiones el upstream atribuye resultados de herramienta al round equivocado y el modelo
+// entra en verificación infinita. Renombra solo los repetidos, en PAREJA (call + su resultado),
+// con sufijo determinista; los ids ya únicos quedan intactos.
+function uniqueToolCallIds(messages) {
+	const used = new Set();
+	let dup = 0;
+	// mapea los ids de la ÚLTIMA assistant vista con tool_calls → sus resultados posteriores
+	let callerMap = new Map();
+	return messages.map((message) => {
+		const mapped = { ...message };
+		if (Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
+			callerMap = new Map();
+			mapped.tool_calls = message.tool_calls.map((call) => {
+				const id = call?.id;
+				let final = id;
+				if (typeof id === "string" && id) {
+					if (used.has(id)) {
+						final = `${id}__d${dup + 1}`;
+						while (used.has(final)) final = `${id}__d${dup + 1}`;
+						dup += 1;
+					}
+					used.add(final);
+					callerMap.set(id, final);
+				}
+				return { ...call, id: final };
+			});
+		}
+		if (mapped.role === "tool" && typeof mapped.tool_call_id === "string" && callerMap.has(mapped.tool_call_id)) {
+			mapped.tool_call_id = callerMap.get(mapped.tool_call_id);
+		}
+		return mapped;
+	});
 }
 
 // Ajusta mensajes OpenAI al formato nativo de Ollama: contenido no-string serializado, arguments como
